@@ -39,6 +39,14 @@ const AIR_PERM = (() => { try { return mc.BlockPermutation.resolve("minecraft:ai
 const guiState = new Map(); // playerName -> st
 
 // ------------------------- 小工具 -------------------------
+function copyRange(src, dst, srcFrom, dstFrom, n) {
+  for (let k = 0; k < n; k++) {
+    let it; try { it = src.getItem(srcFrom + k); } catch (e) { continue; }
+    if (!it || isGuide(it)) continue;
+    try { dst.setItem(dstFrom + k, it.clone()); } catch (e) { try { dst.setItem(dstFrom + k, it); } catch (e2) {} }
+  }
+}
+function clearRange(c, from, to) { for (let i = from; i < Math.min(to, contSize(c)); i++) { try { c.setItem(i, undefined); } catch (e) {} } }
 const fl = Math.floor;
 const isAirLike = (id) => id === "minecraft:air" || id === "minecraft:void_air" || id.endsWith("water") || id.endsWith("lava");
 const vkey = (dimId, v) => `${dimId}|${fl(v.x)}|${fl(v.y)}|${fl(v.z)}`;
@@ -67,12 +75,12 @@ function contItems(c) {
   return out;
 }
 
-// 分区布局：按容器大小自适应（大箱子54 / 单箱27）
+// 分区锚点：穿戴区=第1行前5格(0-4)，快捷栏区=第2行(9-17)，背包区=第3行起(18+)；27格单箱用同一套锚点，只是背包区容量小
 function layout(size) {
-  if (size >= 54) return { armor: [0, 1, 2, 3], off: 4, row1Extra: [5, 6, 7, 8], hb: [9, 17], invFrom: 18,
-    labels: { 0: "头盔→", 1: "胸甲→", 2: "护腿→", 3: "靴子→", 4: "副手→", 9: "→快捷栏1~9", 18: "→背包区" } };
-  return { armor: [0, 1, 2, 3], off: 4, row1Extra: [5, 6, 7, 8], hb: [5, 13], invFrom: 14,
-    labels: { 0: "头盔→", 1: "胸甲→", 2: "护腿→", 3: "靴子→", 4: "副手→", 5: "→快捷栏1~9", 14: "→背包区" } };
+  return { armor: [0, 1, 2, 3], off: 4, hb: [9, 17], invFrom: 18,
+    labels: size >= 54
+      ? { 0: "头盔→", 1: "胸甲→", 2: "护腿→", 3: "靴子→", 4: "副手→", 9: "→快捷栏1~9", 18: "→背包区(第3行起全部)" }
+      : { 0: "头盔→", 1: "胸甲→", 2: "护腿→", 3: "靴子→", 4: "副手→", 9: "→快捷栏1~9", 18: "→背包区" } };
 }
 
 // ------------------------- 仓库(大箱子对) -------------------------
@@ -113,6 +121,66 @@ function pairContainer(blocks) { // 优先取合并后的 54 格容器
   for (const b of blocks) { const c = b && getCont(b); const n = c ? contSize(c) : 0; if (n > bestN) { bestN = n; bestC = c; } }
   return bestC;
 }
+function pairSize(dim, a, b) {
+  let best = 0;
+  for (const p of [a, b]) { if (!p) continue; const blk = getBlockSafe(dim, p); const c = blk && getCont(blk); if (c) best = Math.max(best, contSize(c)); }
+  return best;
+}
+function sbChest(dim, p) { try { dim.runCommand(`setblock ${p.x} ${p.y} ${p.z} minecraft:chest`); return true; } catch (e) { return false; } }
+function sbAir(dim, p) { try { dim.runCommand(`setblock ${p.x} ${p.y} ${p.z} minecraft:air`); } catch (e) {} }
+// 强制修复"相邻但未合并"的两只箱子：用 setblock 先清后放触发引擎连接判定
+function ensurePairMerged(dim, a, b, perm) {
+  try { const ba = dim.getBlock(a); if (ba && ba.typeId !== "minecraft:chest" && perm) ba.setPermutation(perm); } catch (e) {}
+  try { const bb = dim.getBlock(b); if (bb && bb.typeId !== "minecraft:chest" && perm) bb.setPermutation(perm); } catch (e) {}
+  if (pairSize(dim, a, b) >= 54) return true;
+  sbAir(dim, b); sbChest(dim, b);
+  if (pairSize(dim, a, b) >= 54) return true;
+  sbAir(dim, a); sbChest(dim, a); sbAir(dim, b); sbChest(dim, b);
+  return pairSize(dim, a, b) >= 54;
+}
+// 源 -> 目标 同位镜像，仅清写公共区间，保住目标箱多出来的尾部；源尾部有货则拒写
+function mirrorCopy(src, dst) {
+  const sn = contSize(src), dn = contSize(dst), n = Math.min(sn, dn);
+  if (sn > dn) {
+    for (let i = dn; i < sn; i++) {
+      let it; try { it = src.getItem(i); } catch (e) { it = undefined; }
+      if (it && !isGuide(it)) return { ok: false, tail: i };
+    }
+  }
+  clearRange(dst, 0, n);
+  copyRange(src, dst, 0, 0, n);
+  return { ok: true };
+}
+// ---- 半箱视图：基岩版"大箱子"= 两个27格半箱（UI上3行=先放的半箱）。API里单看任何一格都是27，
+// ---- 因此统一用 vcont 把两半拼成逻辑54格视图，所有读写只面对视图，与引擎是否报54无关。
+function vcont(parts0) {
+  const parts = parts0.filter((x) => !!x);
+  const offs = []; let acc = 0;
+  for (const c of parts) { offs.push(acc); acc += contSize(c); }
+  const locate = (i) => {
+    for (let k = parts.length - 1; k >= 0; k--) {
+      const s = i - offs[k];
+      if (s >= 0 && s < contSize(parts[k])) return [parts[k], s];
+    }
+    return [null, 0];
+  };
+  return {
+    size: acc,
+    getItem(i) { const [c, s] = locate(i); if (!c) return undefined; try { return c.getItem(s); } catch (e) { return undefined; } },
+    setItem(i, it) { const [c, s] = locate(i); if (!c) return; try { c.setItem(s, it); } catch (e) {} },
+    _raw: parts
+  };
+}
+function guiView(st) { // 玩家身边配置箱的 54 格视图（两半箱）或 27 格（单箱）
+  const ba = getBlockSafe(st.dim, st.a);
+  const bb = st.b ? getBlockSafe(st.dim, st.b) : null;
+  const ca = ba && ba.typeId === "minecraft:chest" ? getCont(ba) : null;
+  const cb = bb && bb.typeId === "minecraft:chest" ? getCont(bb) : null;
+  if (ca && contSize(ca) >= 54) return vcont([ca]);
+  if (cb && contSize(cb) >= 54) return vcont([cb]);
+  if (st.kind === "double" && ca && cb) return vcont([ca, cb]);
+  return vcont([ca]);
+}
 function getVaultChest(player, kit) { // 返回 {blocks, cont}
   const idx = getPlayerIdx(player);
   ensureVaultArea(idx);
@@ -123,7 +191,10 @@ function getVaultChest(player, kit) { // 返回 {blocks, cont}
   const a = getBlockSafe(dim, pair[0]), b = getBlockSafe(dim, pair[1]);
   if (!a || !b) return undefined;
   for (const blk of [a, b]) { if (blk.typeId !== "minecraft:chest") { try { blk.setPermutation(p); } catch (e) {} } }
-  const cont = pairContainer([getBlockSafe(dim, pair[0]), getBlockSafe(dim, pair[1])]) || getCont(a);
+  const ca = getCont(getBlockSafe(dim, pair[0]));
+  const cb = getCont(getBlockSafe(dim, pair[1]));
+  const cont = (ca && contSize(ca) >= 54) ? vcont([ca]) : (cb && contSize(cb) >= 54) ? vcont([cb]) : vcont([ca, cb]);
+  if (!cont || cont.size === 0) return undefined;
   // 旧版单箱数据迁移
   try {
     const lg = getBlockSafe(dim, vaultPairLegacy(idx, kit));
@@ -152,7 +223,7 @@ function findGuiSpots(player) { // 返回候选[{a,b?单箱为null,origA,origB,d
     if (v) { if (Math.abs(v.x) >= Math.abs(v.z)) { vx = v.x > 0 ? 1 : -1; vz = 0; } else { vz = v.z > 0 ? 1 : -1; vx = 0; } }
   } catch (e) {}
   const fx = fl(loc.x), fy = fl(loc.y), fz = fl(loc.z);
-  const ox = vz === 0 ? 0 : 1, oz = vx === 0 ? 0 : 1; // 与视线垂直的方向
+  const ox = 0, oz = 1; // 配对固定沿南北方向（z 轴）排布，实测该朝向合并大箱子最稳定
   const cands = [];
   for (let k = 2; k <= 4; k++) cands.push({ x: fx + vx * k, y: fy + 1, z: fz + vz * k });
   [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]].forEach(([dx, dz]) => {
@@ -237,16 +308,35 @@ function openKitEditor(player, kit) {
   guiState.set(player.name, st);
   persistGui(player, st);
   try { player.setDynamicProperty(P("last"), kit); } catch (e) {}
+  // 方块实体需要 1~2 tick 才挂上容器，延迟校验并填充
   setTimeoutSafe(() => {
     if (guiState.get(player.name) !== st) return;
-    const gcont = pairContainer([getBlockSafe(st.dim, st.a), st.b ? getBlockSafe(st.dim, st.b) : null]) || getCont(getBlockSafe(st.dim, st.a));
-    if (!gcont) { finishGui(player, false); say(player, "§c读取箱子容器失败，请靠近位置重试 /k:kits " + kit); return; }
-    copyCont(vault.cont, gcont, contSize(gcont)); // 仓库 -> 配置箱（按同尺寸布局）
-    putGuides(gcont);                             // 空位放置分区指引标签（保存时自动剔除）
+    if (st.kind === "double") {
+      let bb1 = getBlockSafe(st.dim, st.b);
+      if (!bb1 || bb1.typeId !== "minecraft:chest") {
+        ensurePairMerged(st.dim, st.a, st.b, chestPerm()); // 半箱缺失时用 setblock 补放
+        bb1 = getBlockSafe(st.dim, st.b);
+      }
+      if (!bb1 || bb1.typeId !== "minecraft:chest") {
+        st.kind = "single"; st.b = null; st.origB = null;
+        say(player, "§e附近放不下第二半只箱子，本次按 27 格单箱编辑（下次请到更开阔处重开）。");
+      }
+    }
+    const gcont = guiView(st);
+    if (!gcont || gcont.size === 0) { finishGui(player, false); say(player, "§c读取箱子容器失败，请靠近位置重试 /k:kits " + kit); return; }
+    const r0 = mirrorCopy(vault.cont, gcont); // 仓库 -> 配置箱（同位镜像，不伤仓库尾部）
+    if (!r0.ok) {
+      guiState.delete(player.name); dropGuiProp(player);
+      try { clearCont(gcont); } catch (e) {}
+      restoreSpot(st);
+      say(player, `§c配置箱(${contSize(gcont)}格)装不下仓库内容(第${r0.tail + 1}格溢出)，数据未动。请清理出 54 格大箱空间后重试 /k:kits ${kit}。`);
+      return;
+    }
+    putGuides(gcont);                           // 空位放置分区指引标签（保存时自动剔除）
     try { st.dim.runCommand(`data modify block ${st.a.x} ${st.a.y} ${st.a.z} CustomName set value "套装${kit}·配置箱(54格分区)"`); } catch (e) {}
     const cnt = contItems(gcont).length;
     try { player.onScreenDisplay.setActionBar(`§e【套装 ${kit}】已载入：${cnt} 格内容（第1行=穿戴区，第2行=快捷栏区，其余=背包区）`); } catch (e) { say(player, `§e【套装 ${kit}】已载入：${cnt} 格内容`); }
-  }, 4);
+  }, 6);
   try { player.playSound("random.chestopen", { volume: 0.8 }); } catch (e) {}
   say(player, `§a正在放置【套装 ${kit}】配置箱（${st.kind === "double" ? "大箱子 54 格" : "单箱 27 格"}）§r\n§7分区：第1行前5格=头盔/胸甲/护腿/靴子/副手；第2行=快捷栏1~9；其余=背包。\n§7蓝色▲纸片只是位置标签，可直接拿走，保存时自动剔除。§o关箱即自动保存。§r`);
 }
@@ -256,31 +346,31 @@ function finishGui(player, announce) {
   if (!st) return false;
   guiState.delete(player.name);
   dropGuiProp(player);
-  let ok = true, empty = true, savedKit = st.kit;
-  const gcont0 = pairContainer([getBlockSafe(st.dim, st.a), st.b ? getBlockSafe(st.dim, st.b) : null]) || getCont(getBlockSafe(st.dim, st.a));
-  const vault0 = getVaultChest(player, savedKit);
-  const vcont0 = vault0 && vault0.cont;
-  if (gcont0 && vcont0 && contSize(gcont0) < contSize(vcont0)) {
-    // 配置箱缩水成单箱而仓库是大箱：直接保存会丢尾部数据，中止并保留箱子等待处理
-    guiState.set(player.name, st);
-    say(player, "§c暂不保存：配置箱只有 " + contSize(gcont0) + " 格但仓库是 " + contSize(vcont0) + " 格大箱子。请把周围清出可放 54 格大箱子的空间后再 /k:kitsdone，或直接改用 /k:kitsdel " + savedKit + " 强制作废本次编辑。");
-    return false;
-  }
+  const savedKit = st.kit;
+  let ok = true, empty = true;
+  const vault = getVaultChest(player, savedKit);
+  const vcontObj = vault && vault.cont;
+  const gcont = guiView(st);
+  const gN = gcont ? gcont.size : 0;
+  const vN = vcontObj ? vcontObj.size : 0;
   try {
-    const gcont = pairContainer([getBlockSafe(st.dim, st.a), st.b ? getBlockSafe(st.dim, st.b) : null]) || getCont(getBlockSafe(st.dim, st.a));
-    const vault = getVaultChest(player, savedKit);
-    const vcont = vault && vault.cont;
-    if (gcont && vcont) {
+    if (!vcontObj || !gcont || gN === 0) { ok = false; }
+    else {
       stripGuides(gcont);
-      copyCont(gcont, vcont, contSize(vcont));
+      const r = mirrorCopy(gcont, vcontObj); // 半箱对半箱同位镜像，两半内容都会入库
+      if (!r.ok) {
+        guiState.set(player.name, st);
+        if (announce) say(player, `§c暂不保存：配置箱第 ${r.tail + 1} 格的内容超出仓库容量(${vN}格)，仓库数据未动。请关箱后到更开阔处重新 /k:kits ${savedKit}。`);
+        return false;
+      }
       clearCont(gcont);
-      empty = contItems(vcont).length === 0;
-    } else ok = false;
+      empty = contItems(vcontObj).length === 0;
+    }
   } catch (e) { ok = false; }
   restoreSpot(st);
   setHas(player, savedKit, ok ? !empty : isHas(player, savedKit));
   try { player.playSound("random.chestclosed", { volume: 0.8 }); } catch (e) {}
-  if (announce) say(player, ok ? (empty ? `§e套装 ${savedKit} 已保存（空 = 该套装已清空）。` : `§a套装 ${savedKit} 已保存。`) : "§c保存配置箱失败，箱子已收回，请检查物品是否在原地。");
+  if (announce) say(player, ok ? (empty ? `§e套装 ${savedKit} 已保存（空 = 该套装已清空）。` : `§a套装 ${savedKit} 已保存。`) : "§c未能读取配置箱或仓库，本次未改动数据。");
   return ok;
 }
 function countKit(player, kit) {
@@ -309,31 +399,42 @@ function equipKit(player, kit) {
   try { inv = getCont(player); eq = player.getComponent("minecraft:equippable"); } catch (e) {}
   if (!inv || !eq) { say(player, "§c读取玩家背包/装备栏失败。"); return; }
   const L = layout(contSize(vault.cont));
+  const SZ = contSize(vault.cont);
+  const drop = (it) => { try { player.dimension.spawnItem(it, player.location); } catch (e) {} };
   const putInv = (item) => {
     let left; try { left = inv.addItem(item); } catch (e) { left = item; }
-    if (left) { try { player.dimension.spawnItem(left, player.location); } catch (e) {} }
+    if (left) drop(left);
+  };
+  const putAt = (slot, item) => { // 严格对位：目标格原有物品掉脚下，保证顺序与配置箱一致
+    if (slot < 0 || slot >= contSize(inv)) { putInv(item); return; }
+    let cur; try { cur = inv.getItem(slot); } catch (e) { cur = undefined; }
+    try { inv.setItem(slot, item); if (cur) drop(cur); } catch (e) { putInv(item); }
   };
   let eqN = 0, hbN = 0, invN = 0;
-  for (const { i, it } of items) {
+  const invBase = 18; // 分区锚点全局统一（单箱/双箱同位）
+  const invEnd = Math.min(SZ - 1, 44);
+  const isFixed = (i) => { const es = armorSlotOf(i, L); return es !== null || (i >= L.hb[0] && i <= L.hb[1]) || (i >= invBase && i <= invEnd); };
+  const pass2 = [];
+  for (const e of items) { if (!isFixed(e.i)) { pass2.push(e); continue; }
+    const { i, it } = e;
     const es = armorSlotOf(i, L);
     if (es) {
-      let old; try { old = eq.getEquipment(es); } catch (e) {}
-      let done = false; try { done = eq.setEquipment(es, it.clone()); } catch (e) {}
-      if (done) { eqN++; if (old) putInv(old); } else putInv(it.clone());
+      let old; try { old = eq.getEquipment(es); } catch (err) {}
+      let done = false; try { done = eq.setEquipment(es, it.clone()); } catch (err) {}
+      if (done) { eqN++; if (old) drop(old); } else putInv(it.clone());
     } else if (i >= L.hb[0] && i <= L.hb[1]) {
-      const target = i - L.hb[0]; // 快捷栏 0~8
-      let placed = false, old = undefined;
-      try { old = inv.getItem(target); } catch (e) {}
-      try { inv.setItem(target, it.clone()); placed = true; } catch (e) { placed = false; }
-      if (placed) { hbN++; if (old) putInv(old); } else putInv(it.clone());
-    } else { putInv(it.clone()); invN++; }
+      putAt(i - L.hb[0], it.clone()); hbN++;
+    } else {
+      putAt(9 + (i - invBase), it.clone()); invN++;
+    }
   }
+  for (const { it } of pass2) { putInv(it.clone()); invN++; } // 溢出区（穿戴行后4格/背包尾部）最后进背包
   try { player.playSound("random.levelup", { volume: 0.5, pitch: 1.5 }); } catch (e) {}
-  say(player, `§a已穿戴套装 ${kit}：装备 ${eqN} 件、快捷栏 ${hbN} 格、背包 ${invN} 项。§r§7（旧装备掉在脚下；kit 为预设可反复领用）`);
+  say(player, `§a已穿戴套装 ${kit}：穿戴区 ${eqN} 件→身上对应栏，快捷栏区 ${hbN} 格→快捷栏1~9原位，背包区 ${invN} 项→背包顺序排布。§r§7（被占/被替换的原物品均掉在脚下；kit 为预设可反复领用）`);
 }
 function deleteKit(player, kit) {
   const st = guiState.get(player.name);
-  if (st && st.kit === kit) { guiState.delete(player.name); dropGuiProp(player); try { const g = pairContainer([getBlockSafe(st.dim, st.a), st.b ? getBlockSafe(st.dim, st.b) : null]); if (g) clearCont(g); } catch (e) {} restoreSpot(st); }
+  if (st && st.kit === kit) { guiState.delete(player.name); dropGuiProp(player); try { const g = guiView(st); if (g && g.size) clearCont(g); } catch (e) {} restoreSpot(st); }
   const vault = getVaultChest(player, kit);
   if (!vault || !vault.cont) { say(player, "§c仓库读取失败。"); return; }
   clearCont(vault.cont);
@@ -368,8 +469,8 @@ function subMenu(player, kit) {
   try {
     const has = isHas(player, kit);
     const form = new ActionFormData().title(`套装 ${kit}`).body(has ? `§7已配置：${kitBrief(player, kit) || "见配置箱"}\n§7选择操作：` : `§7该槽位为空，点下方开始配置：`);
-    if (has) { form.button("§a⚡穿戴这套"); form.button("§e编辑（开配置箱）"); form.button("§c删除这套"); }
-    else form.button("§e开始配置（开配置箱）");
+    if (has) { form.button("§a⚡ 穿戴这套"); form.button("§e📦 编辑（开配置箱）"); form.button("§c🗑 删除这套"); }
+    else form.button("§e📦 开始配置（开配置箱）");
     form.show(player).then((r) => {
       if (r.canceled) return;
       if (!has) { openKitEditor(player, kit); return; }
@@ -463,11 +564,14 @@ function recoverStale(player) {
     const dim = world.getDimension(st.dim);
     const ba = getBlockSafe(dim, st.a), bb = st.b ? getBlockSafe(dim, st.b) : null;
     if ((ba && ba.typeId === "minecraft:chest") || (bb && bb.typeId === "minecraft:chest")) {
-      const gcont = pairContainer([ba, bb]);
+      const ca2 = ba && ba.typeId === "minecraft:chest" ? getCont(ba) : null;
+      const cb2 = bb && bb.typeId === "minecraft:chest" ? getCont(bb) : null;
+      const gcont = (ca2 && contSize(ca2) >= 54) ? vcont([ca2]) : (cb2 && contSize(cb2) >= 54) ? vcont([cb2]) : vcont([ca2, cb2]);
       const vault = getVaultChest(player, st.kit);
-      if (gcont && vault && vault.cont) {
+      if (gcont && gcont.size > 0 && vault && vault.cont) {
         stripGuides(gcont);
-        copyCont(gcont, vault.cont, contSize(vault.cont));
+        const rr = mirrorCopy(gcont, vault.cont);
+        if (!rr.ok) { say(player, `§c发现遗留配置箱，但其第 ${rr.tail + 1} 格超出仓库规格，未自动保存，请手动处理该箱子。`); return; }
         clearCont(gcont);
         setHas(player, st.kit, contItems(vault.cont).length > 0);
       }
